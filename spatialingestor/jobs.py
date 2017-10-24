@@ -22,7 +22,7 @@ from ckanserviceprovider import job, util, web
 from lxml import etree
 from osgeo import osr
 
-
+from spatialingestor import ogr2ogr
 if not locale.getlocale()[0]:
     locale.setlocale(locale.LC_ALL, '')
 
@@ -66,6 +66,16 @@ class HTTPError(util.JobError):
             "Requested URL": self.request_url,
             "Response": response,
         }
+
+
+#Generate the file paths to traverse, or a single path if a file name was given
+def getfiles(path):
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path):
+            for name in files:
+                yield os.path.join(root, name)
+    else:
+        yield path
 
 
 def get_url(action, ckan_url):
@@ -159,7 +169,7 @@ def validate_input(input):
     if missing_db_metadata_keys:
         raise util.JobError('Missing DB metadata keys: {0}'.format(missing_db_metadata_keys))
 
-    required_geoserver_metadata_keys = required_db_metadata_keys
+        required_geoserver_metadata_keys = required_db_metadata_keys
 
     missing_geoserver_metadata_keys = required_geoserver_metadata_keys - set(input['metadata']['geoserver'].keys())
 
@@ -199,10 +209,10 @@ def get_db_cursor(data):
         raise util.JobError("Failed to connect with PostGIS with error {0}".format(str(e)))
 
 
-def setup_spatial_table(data, resource):
+def setup_spatial_table(data, resource_id):
     cursor, connection = get_db_cursor(data)
 
-    table_name = "sp_" + resource['id'].replace("-", "_")
+    table_name = "sp_" + resource_id.replace("-", "_")
 
     cursor.execute("DROP TABLE IF EXISTS {tab_name}".format(tab_name=table_name))
     cursor.close()
@@ -281,14 +291,14 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
         if 'db_port' in data['postgis']:
             port_string = '\' port=\'' + data['postgis']['db_port']
 
-        args = ['ogr2ogr', '-f', 'PostgreSQL', "--config", "PG_USE_COPY", "YES",
+        args = ['', '-f', 'PostgreSQL', "--config", "PG_USE_COPY", "YES",
                 'PG:dbname=\'' + data['postgis']['db_name'] + '\' host=\'' + data['postgis'][
                     'db_host'] + port_string + '\' user=\'' + data['postgis'][
                     'db_user'] + '\' password=\'' + data['postgis']['db_pass'] + '\'', full_file_path, '-lco',
                 'GEOMETRY_NAME=geom', "-lco", "PRECISION=NO", '-nln', table_name, '-a_srs', crs,
                 '-nlt', 'PROMOTE_TO_MULTI', '-overwrite']
 
-        return call(args)
+        return ogr2ogr.main(pargs)
 
     tempdir = tempfile.mkdtemp()
 
@@ -306,6 +316,21 @@ def db_upload(data, parent_resource, input_format, table_name, logger):
                 unzip_dir = unzip_file(zpf, base_filepath)
             except:
                 raise util.JobError("{0} is not a valid zip file".format(base_filepath))
+
+            # Flatten the zip file
+            for root, dirs, files in os.walk(unzip_dir):
+                for sub_dir in dirs:
+                    from_dir = os.path.join(root, sub_dir)
+                    for f in getfiles(from_dir):
+                        filename = f.split('/')[-1]
+                        if os.path.isfile(os.path.join(unzip_dir, filename)):
+                            filename = f.replace(from_dir, "", 1).replace("/", "_")
+                        shutil.copy(f, os.path.join(unzip_dir, filename))
+                    shutil.rmtree(from_dir)
+
+            for f in os.listdir(unzip_dir):
+                if f.lower().endswith(".kml"):
+                    kml_file = os.path.join(unzip_dir, f)
 
             try:
                 os.remove(os.path.join(base_filepath))
@@ -775,10 +800,10 @@ def spatial_ingest(task_id, input):
     # and we have potential resources for creation.
     logger.info('Setting up PostGIS table for spatial assets')
 
-    table_name = setup_spatial_table(data, resource)
+    table_name = setup_spatial_table(data, data['resource_id'])
 
     # Determine input format
-    logger.info('Determing input format for resource')
+    logger.info('Determining input format for resource')
 
     input_format = get_spatial_input_format(resource)
 
@@ -821,14 +846,15 @@ def spatial_purge(task_id, input):
 
     data = input['metadata']
     data['api_key'] = input['api_key']
-
+    print data
+    logger.info(data)
     logger.info('Retrieving resource information')
 
     resource = ckan_command('resource_show', {'id': data['resource_id']}, data)
 
     logger.info('Dropping PostGIS table from DB')
 
-    setup_spatial_table(data, resource)
+    setup_spatial_table(data, data['resource_id'])
 
     logger.info('Purging Geoserver assets')
 
